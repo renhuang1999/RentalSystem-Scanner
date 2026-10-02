@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#102d49">
+  <title>設備連續掃描器</title>
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#f4f7fa;color:#172332;font:16px Arial,"Microsoft JhengHei",sans-serif}header{background:#102d49;color:#fff;padding:18px max(18px,env(safe-area-inset-right)) 18px max(18px,env(safe-area-inset-left))}header h1{font-size:22px;margin:0 0 5px}header p{margin:0;color:#bcd0e1;font-size:13px}main{max-width:620px;margin:auto;padding:16px 16px calc(24px + env(safe-area-inset-bottom))}.card{background:#fff;border:1px solid #dce5ed;border-radius:14px;padding:16px;box-shadow:0 5px 18px #15314d0b;margin-bottom:14px}.status{padding:12px;border-radius:9px;background:#eff6ff;color:#1e40af;font-weight:700;line-height:1.5}.status.ok{background:#dcfce7;color:#166534}.status.error{background:#fee2e2;color:#991b1b}.actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}button{min-height:50px;border:1px solid #cbd7e2;border-radius:9px;background:#fff;font:inherit;font-weight:700}button.primary{border-color:#176ac0;background:#176ac0;color:#fff}button:disabled{opacity:.55}#reader{margin-top:14px;border-radius:12px;overflow:hidden;background:#111}#reader video{width:100%!important}.hint{font-size:13px;line-height:1.55;color:#64748b;margin:12px 0 0}.history{list-style:none;padding:0;margin:0;display:grid;gap:8px}.history li{padding:10px 12px;border-radius:8px;background:#f8fafc;border-left:4px solid #94a3b8;overflow-wrap:anywhere}.history li.ok{border-left-color:#22c55e}.history li.error{border-left-color:#ef4444}.history small{display:block;color:#64748b;margin-top:3px}@media(max-width:420px){.actions{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>設備連續掃描器</h1>
+    <p id="orderText">正在讀取配對資訊…</p>
+  </header>
+  <main>
+    <section class="card">
+      <div id="status" class="status">請按「開啟相機」並允許相機權限。</div>
+      <div class="actions">
+        <button id="startButton" class="primary" type="button">開啟相機</button>
+        <button id="stopButton" type="button" disabled>停止掃描</button>
+      </div>
+      <div id="reader"></div>
+      <p class="hint">相機會保持開啟。每掃描一個設備 QR Code，資料會直接送回電腦上的清點畫面，不需要拍照、上傳或重新開啟網頁。</p>
+    </section>
+    <section class="card">
+      <strong>本次掃描紀錄</strong>
+      <ul id="history" class="history"><li>尚未掃描任何設備</li></ul>
+    </section>
+  </main>
+  <script>
+    (() => {
+      'use strict';
+      const params = new URLSearchParams(location.search);
+      const token = params.get('token') || '';
+      const endpoint = params.get('endpoint') || '';
+      const orderId = params.get('order') || '';
+      const status = document.getElementById('status');
+      const history = document.getElementById('history');
+      const startButton = document.getElementById('startButton');
+      const stopButton = document.getElementById('stopButton');
+      const validPairing = /^[a-f0-9]{32}$/i.test(token) && /^https:\/\/script\.google\.com\//i.test(endpoint);
+      let scanner = null;
+      let running = false;
+      let sending = false;
+      let firstHistory = true;
+      let lastCode = '';
+      let lastSentAt = 0;
+
+      document.getElementById('orderText').textContent = orderId ? `清點單號：${orderId}` : '設備租借清點';
+
+      function setStatus(message, type) {
+        status.textContent = message;
+        status.className = `status${type ? ` ${type}` : ''}`;
+      }
+
+      function addHistory(code, message, type) {
+        if (firstHistory) { history.innerHTML = ''; firstHistory = false; }
+        const item = document.createElement('li');
+        item.className = type || '';
+        const title = document.createElement('strong');
+        title.textContent = code;
+        const detail = document.createElement('small');
+        detail.textContent = `${message} · ${new Date().toLocaleTimeString('zh-TW')}`;
+        item.append(title, detail);
+        history.prepend(item);
+      }
+
+      function normalizeAssetCode(decodedText) {
+        let value = String(decodedText || '').trim();
+        if (/^ASSET:/i.test(value)) value = value.slice(6).trim();
+        try {
+          const url = new URL(value);
+          value = url.searchParams.get('asset') || value;
+        } catch (_) {}
+        value = value.trim().toUpperCase();
+        return /^[A-Z0-9._-]{1,80}$/.test(value) ? value : '';
+      }
+
+      function signal(success) {
+        if (navigator.vibrate) navigator.vibrate(success ? 100 : [100, 70, 100]);
+      }
+
+      function sendScan(assetCode) {
+        return new Promise((resolve, reject) => {
+          const callback = `rentalScan_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+          const script = document.createElement('script');
+          const timer = setTimeout(() => finish(new Error('伺服器回應逾時')), 15000);
+          let finished = false;
+          function cleanup() {
+            clearTimeout(timer);
+            delete window[callback];
+            script.remove();
+          }
+          function finish(error, data) {
+            if (finished) return;
+            finished = true;
+            cleanup();
+            error ? reject(error) : resolve(data);
+          }
+          window[callback] = data => {
+            if (!data || data.ok !== true) finish(new Error((data && data.error) || '清點失敗'));
+            else finish(null, data);
+          };
+          script.onerror = () => finish(new Error('無法連線到掃描服務'));
+          const query = new URLSearchParams({api:'scan', token, asset:assetCode, callback});
+          script.src = `${endpoint}${endpoint.includes('?') ? '&' : '?'}${query}`;
+          document.head.appendChild(script);
+        });
+      }
+
+      async function onDecoded(decodedText) {
+        const assetCode = normalizeAssetCode(decodedText);
+        const now = Date.now();
+        if (sending || (assetCode && assetCode === lastCode && now - lastSentAt < 2500)) return;
+        if (!assetCode) {
+          setStatus('這不是有效的設備 QR Code，請掃描設備標籤。', 'error');
+          signal(false);
+          return;
+        }
+        sending = true;
+        lastCode = assetCode;
+        lastSentAt = now;
+        setStatus(`正在送出 ${assetCode}…`);
+        try {
+          const result = await sendScan(assetCode);
+          setStatus(`✓ ${assetCode} 已完成清點，可繼續掃描下一件。`, 'ok');
+          addHistory(assetCode, result.status || '已完成清點', 'ok');
+          signal(true);
+        } catch (error) {
+          setStatus(`✕ ${assetCode}：${error.message}`, 'error');
+          addHistory(assetCode, error.message, 'error');
+          signal(false);
+        } finally {
+          sending = false;
+        }
+      }
+
+      async function startCamera() {
+        if (!validPairing) return;
+        startButton.disabled = true;
+        setStatus('正在開啟後鏡頭…');
+        try {
+          scanner = scanner || new Html5Qrcode('reader');
+          await scanner.start(
+            { facingMode: 'environment' },
+            { fps: 10, qrbox: (width, height) => {
+              const size = Math.floor(Math.min(width, height) * 0.72);
+              return { width: size, height: size };
+            }},
+            onDecoded,
+            () => {}
+          );
+          running = true;
+          stopButton.disabled = false;
+          setStatus('相機已開啟，請將設備 QR Code 對準框內。');
+        } catch (error) {
+          startButton.disabled = false;
+          setStatus(`無法開啟相機：${error && error.message ? error.message : error}`, 'error');
+        }
+      }
+
+      async function stopCamera() {
+        if (!scanner || !running) return;
+        stopButton.disabled = true;
+        try { await scanner.stop(); } catch (_) {}
+        running = false;
+        startButton.disabled = false;
+        setStatus('掃描已停止；需要時可再次開啟相機。');
+      }
+
+      startButton.addEventListener('click', startCamera);
+      stopButton.addEventListener('click', stopCamera);
+      addEventListener('pagehide', () => { if (scanner && running) scanner.stop().catch(() => {}); });
+
+      if (!validPairing) {
+        startButton.disabled = true;
+        setStatus('配對連結無效或已缺少必要資訊，請回到電腦重新產生配對 QR Code。', 'error');
+      }
+    })();
+  </script>
+</body>
+</html>
