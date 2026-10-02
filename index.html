@@ -83,32 +83,25 @@
         if (navigator.vibrate) navigator.vibrate(success ? 100 : [100, 70, 100]);
       }
 
-      function sendScan(assetCode) {
-        return new Promise((resolve, reject) => {
-          const callback = `rentalScan_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
-          const script = document.createElement('script');
-          const timer = setTimeout(() => finish(new Error('伺服器回應逾時')), 15000);
-          let finished = false;
-          function cleanup() {
-            clearTimeout(timer);
-            delete window[callback];
-            script.remove();
-          }
-          function finish(error, data) {
-            if (finished) return;
-            finished = true;
-            cleanup();
-            error ? reject(error) : resolve(data);
-          }
-          window[callback] = data => {
-            if (!data || data.ok !== true) finish(new Error((data && data.error) || '清點失敗'));
-            else finish(null, data);
-          };
-          script.onerror = () => finish(new Error('無法連線到掃描服務'));
-          const query = new URLSearchParams({api:'scan', token, asset:assetCode, callback});
-          script.src = `${endpoint}${endpoint.includes('?') ? '&' : '?'}${query}`;
-          document.head.appendChild(script);
-        });
+      async function sendScan(assetCode) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15000);
+        const query = new URLSearchParams({api:'scan', format:'json', token, asset:assetCode});
+        try {
+          const response = await fetch(`${endpoint}${endpoint.includes('?') ? '&' : '?'}${query}`, {
+            method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-store', signal: controller.signal
+          });
+          if (!response.ok) throw new Error(`掃描服務回應錯誤（${response.status}）`);
+          const data = await response.json();
+          if (!data || data.ok !== true) throw new Error((data && data.error) || '清點失敗');
+          return data;
+        } catch (error) {
+          if (error && error.name === 'AbortError') throw new Error('伺服器回應逾時');
+          if (error instanceof TypeError) throw new Error('無法連線到掃描服務，請確認手機網路後重試');
+          throw error;
+        } finally {
+          clearTimeout(timer);
+        }
       }
 
       async function onDecoded(decodedText) {
