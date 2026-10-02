@@ -83,24 +83,56 @@
         if (navigator.vibrate) navigator.vibrate(success ? 100 : [100, 70, 100]);
       }
 
-      async function sendScan(assetCode) {
+      async function fetchJson(url, timeoutMs) {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 15000);
-        const query = new URLSearchParams({api:'scan', format:'json', token, asset:assetCode});
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
-          const response = await fetch(`${endpoint}${endpoint.includes('?') ? '&' : '?'}${query}`, {
+          const response = await fetch(url, {
             method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-store', signal: controller.signal
           });
           if (!response.ok) throw new Error(`掃描服務回應錯誤（${response.status}）`);
-          const data = await response.json();
-          if (!data || data.ok !== true) throw new Error((data && data.error) || '清點失敗');
-          return data;
+          return await response.json();
         } catch (error) {
           if (error && error.name === 'AbortError') throw new Error('伺服器回應逾時');
           if (error instanceof TypeError) throw new Error('無法連線到掃描服務，請確認手機網路後重試');
           throw error;
         } finally {
           clearTimeout(timer);
+        }
+      }
+
+      function serviceUrl(parameters) {
+        const query = new URLSearchParams(parameters);
+        return `${endpoint}${endpoint.includes('?') ? '&' : '?'}${query}`;
+      }
+
+      async function verifyProcessed(assetCode) {
+        const url = serviceUrl({api:'scan-status', token, asset:assetCode});
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (attempt) await new Promise(resolve => setTimeout(resolve, 1800));
+          try {
+            const statusResult = await fetchJson(url, 15000);
+            if (statusResult && statusResult.ok === true && statusResult.processed === true) return true;
+            if (statusResult && statusResult.ok === false) throw new Error(statusResult.error || '無法確認清點狀態');
+          } catch (error) {
+            if (attempt === 2) throw error;
+          }
+        }
+        return false;
+      }
+
+      async function sendScan(assetCode) {
+        const url = serviceUrl({api:'scan', format:'json', token, asset:assetCode});
+        try {
+          const data = await fetchJson(url, 25000);
+          if (!data || data.ok !== true) {
+            if (await verifyProcessed(assetCode)) return {ok:true, verified:true};
+            throw new Error((data && data.error) || '清點失敗');
+          }
+          return data;
+        } catch (error) {
+          if (await verifyProcessed(assetCode)) return {ok:true, verified:true};
+          throw error;
         }
       }
 
@@ -119,8 +151,8 @@
         setStatus(`正在送出 ${assetCode}…`);
         try {
           const result = await sendScan(assetCode);
-          setStatus(`✓ ${assetCode} 已完成清點，可繼續掃描下一件。`, 'ok');
-          addHistory(assetCode, result.status || '已完成清點', 'ok');
+          setStatus(`✓ ${assetCode} 伺服器已登錄；電腦畫面同步中，可繼續掃描下一件。`, 'ok');
+          addHistory(assetCode, result.verified ? '已查證伺服器完成登錄' : '伺服器已完成登錄', 'ok');
           signal(true);
         } catch (error) {
           setStatus(`✕ ${assetCode}：${error.message}`, 'error');
